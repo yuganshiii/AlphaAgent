@@ -1,0 +1,36 @@
+# Agent framework
+langgraph
+langchain-openai
+openai
+
+# Market & financial data
+yfinance
+requests
+
+# Technical analysis
+ta
+
+# Vector store & embeddings
+chromadb
+sentence-transformers
+
+# PDF parsing
+PyMuPDF
+
+# Backend
+fastapi
+uvicorn[standard]
+pydantic
+
+# Frontend
+streamlit
+
+# Testing
+pytest
+pytest-asyncio
+httpx
+
+# Utilities
+python-dotenv
+pandas
+numpy
