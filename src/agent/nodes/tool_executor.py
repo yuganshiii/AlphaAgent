@@ -32,7 +32,7 @@ def _run_tool(name: str, state: GraphState) -> tuple[str, object]:
             fundamentals = findings.get("fundamentals")
             if not fundamentals:
                 return name, None
-            result = calculate_ratios(fundamentals)
+            result = calculate_ratios(fundamentals, findings.get("market_data"))
         elif name == "sec_rag":
             sec = findings.get("sec_filings", {})
             url = sec.get("latest_10k_url") if sec else None
