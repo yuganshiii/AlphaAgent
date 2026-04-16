@@ -27,15 +27,18 @@ def _fetch_series(series_id: str, limit: int = 3) -> list[float]:
         "sort_order": "desc",
         "limit": limit,
     }
-    resp = requests.get(FRED_BASE, params=params, timeout=10)
-    resp.raise_for_status()
-    obs = resp.json().get("observations", [])
+    try:
+        resp = requests.get(FRED_BASE, params=params, timeout=10)
+        resp.raise_for_status()
+        obs = resp.json().get("observations", [])
+    except Exception:
+        return []
     values = []
     for o in obs:
         try:
             values.append(float(o["value"]))
         except (ValueError, KeyError):
-            pass
+            pass  # "." is FRED's placeholder for missing data
     return values
 
 

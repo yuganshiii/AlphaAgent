@@ -88,6 +88,7 @@ def test_balance_sheet_keys(mock_cls):
         "total_assets", "total_liabilities", "total_equity",
         "cash_and_equivalents", "short_term_investments", "total_cash",
         "total_debt", "net_debt", "working_capital", "book_value_per_share",
+        "current_ratio", "quick_ratio",
     }
     assert expected == set(bs.keys())
 
