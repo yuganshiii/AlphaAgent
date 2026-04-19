@@ -332,3 +332,115 @@ def test_query_filing_top_k_passed_to_chroma():
         from src.tools.sec_rag import query_filing
         query_filing("revenue growth", "AAPL", top_k=3)
     col.query.assert_called_once_with(query_texts=["revenue growth"], n_results=3)
+
+
+def test_query_filing_min_relevance_filters_low_scores():
+    """Chunks below min_relevance should be dropped from results."""
+    col = _make_collection(
+        count=2,
+        docs=["High relevance chunk.", "Low relevance chunk."],
+        metas=[
+            {"section": "Item 1A. Risk Factors", "word_offset": 0},
+            {"section": "General", "word_offset": 1000},
+        ],
+        distances=[0.1, 0.8],   # relevance = 0.9 and 0.2 respectively
+    )
+    with _patch_chroma(col):
+        from src.tools.sec_rag import query_filing
+        result = query_filing("risk factors", "AAPL", min_relevance=0.5)
+    assert "High relevance chunk." in result
+    assert "Low relevance chunk." not in result
+
+
+def test_query_filing_min_relevance_all_filtered_returns_message():
+    col = _make_collection(
+        count=1,
+        docs=["Irrelevant chunk."],
+        metas=[{"section": "General", "word_offset": 0}],
+        distances=[0.95],   # relevance = 0.05
+    )
+    with _patch_chroma(col):
+        from src.tools.sec_rag import query_filing
+        result = query_filing("risk factors", "AAPL", min_relevance=0.5)
+    assert result == "No results met the minimum relevance threshold."
+
+
+# ── _resolve_primary_doc tests ────────────────────────────────────────────────
+
+@patch("src.tools.sec_rag.requests.get")
+def test_resolve_primary_doc_prefers_ixbrl_link(mock_get):
+    """iXBRL viewer href takes priority over direct archive links."""
+    from src.tools.sec_rag import _resolve_primary_doc
+    # Modern EDGAR filing: primary doc linked via /ix?doc=... viewer
+    index_html = '''
+        <a href="/Archives/edgar/data/320193/000032019324000123/a10-kexhibit4.htm">EX-4</a>
+        <a href="/ix?doc=/Archives/edgar/data/320193/000032019324000123/aapl-20240928.htm">10-K</a>
+    '''
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status.return_value = None
+    mock_resp.text = index_html
+    mock_get.return_value = mock_resp
+
+    url = _resolve_primary_doc(
+        "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/"
+        "0000320193-24-000123-index.htm"
+    )
+    assert url == "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/aapl-20240928.htm"
+
+
+@patch("src.tools.sec_rag.requests.get")
+def test_resolve_primary_doc_falls_back_to_direct_archive_href(mock_get):
+    """Older filings without iXBRL: return first non-index archive .htm."""
+    from src.tools.sec_rag import _resolve_primary_doc
+    index_html = '''
+        <a href="/Archives/edgar/data/320193/000032019324000123/0000320193-24-000123-index.htm">index</a>
+        <a href="/Archives/edgar/data/320193/000032019324000123/aapl-20240928.htm">10-K</a>
+    '''
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status.return_value = None
+    mock_resp.text = index_html
+    mock_get.return_value = mock_resp
+
+    url = _resolve_primary_doc(
+        "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/"
+        "0000320193-24-000123-index.htm"
+    )
+    assert url == "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/aapl-20240928.htm"
+
+
+@patch("src.tools.sec_rag.requests.get")
+def test_resolve_primary_doc_falls_back_on_no_match(mock_get):
+    """If no .htm link found, returns the original index URL unchanged."""
+    from src.tools.sec_rag import _resolve_primary_doc
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status.return_value = None
+    mock_resp.text = "<html><body>No links here</body></html>"
+    mock_get.return_value = mock_resp
+
+    original = "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/0000320193-24-000123-index.htm"
+    assert _resolve_primary_doc(original) == original
+
+
+@patch("src.tools.sec_rag.requests.get")
+def test_extract_text_follows_index_page(mock_get):
+    """When URL ends with -index.htm, _extract_text_from_url resolves it first."""
+    from src.tools.sec_rag import _extract_text_from_url
+
+    index_html = '<a href="/Archives/edgar/data/1/0001-index.htm">self</a><a href="/Archives/edgar/data/1/doc.htm">doc</a>'
+    doc_resp = MagicMock()
+    doc_resp.raise_for_status.return_value = None
+    doc_resp.headers = {"Content-Type": "text/html"}
+    doc_resp.text = "<p>Risk factors text</p>"
+
+    index_resp = MagicMock()
+    index_resp.raise_for_status.return_value = None
+    index_resp.text = index_html
+
+    # First call → index page, second call → resolved document
+    mock_get.side_effect = [index_resp, doc_resp]
+
+    text = _extract_text_from_url(
+        "https://www.sec.gov/Archives/edgar/data/1/0001-index.htm"
+    )
+    assert "Risk factors text" in text
+    assert mock_get.call_count == 2

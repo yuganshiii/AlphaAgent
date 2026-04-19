@@ -24,9 +24,18 @@ def _get_cik(ticker: str) -> str:
     raise ValueError(f"CIK not found for ticker: {ticker}")
 
 
-def _filing_url(accession: str, filename: str) -> str:
-    acc = accession.replace("-", "")
-    return f"https://www.sec.gov/Archives/edgar/data/{acc[:10]}/{acc}/{filename}"
+def _index_url(cik: str, accession: str) -> str:
+    """Return the EDGAR filing index page URL for a specific accession.
+
+    Format: https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_nodash}/{acc}-index.htm
+    This page lists all documents in the filing and links to the primary document.
+    """
+    cik_int = int(cik)
+    acc_nodash = accession.replace("-", "")
+    return (
+        f"https://www.sec.gov/Archives/edgar/data/"
+        f"{cik_int}/{acc_nodash}/{accession}-index.htm"
+    )
 
 
 def get_sec_filings(ticker: str) -> dict:
@@ -49,7 +58,7 @@ def get_sec_filings(ticker: str) -> dict:
 
     for form, date, acc in zip(forms, dates, accessions):
         if form in ("10-K", "10-Q"):
-            url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type={form}&dateb=&owner=include&count=10"
+            url = _index_url(cik, acc)
             entry = {"form": form, "date": date, "accession": acc, "url": url}
             recent_filings.append(entry)
             if form == "10-K" and not latest_10k_url:

@@ -181,7 +181,9 @@ def test_latest_10k_url_set(mock_get):
     from src.tools.sec_edgar import get_sec_filings
     result = get_sec_filings("AAPL")
     assert result["latest_10k_url"] is not None
-    assert "10-K" in result["latest_10k_url"]
+    # URL is now the EDGAR archive index page, not a browse-edgar search page
+    assert "Archives/edgar/data" in result["latest_10k_url"]
+    assert result["latest_10k_url"].endswith("-index.htm")
 
 
 @patch("src.tools.sec_edgar.requests.get")
@@ -190,7 +192,8 @@ def test_latest_10q_url_set(mock_get):
     from src.tools.sec_edgar import get_sec_filings
     result = get_sec_filings("AAPL")
     assert result["latest_10q_url"] is not None
-    assert "10-Q" in result["latest_10q_url"]
+    assert "Archives/edgar/data" in result["latest_10q_url"]
+    assert result["latest_10q_url"].endswith("-index.htm")
 
 
 @patch("src.tools.sec_edgar.requests.get")

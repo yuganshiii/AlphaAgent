@@ -5,7 +5,7 @@ all-MiniLM-L6-v2 via SentenceTransformer, persist in ChromaDB.
 Public API
 ----------
 index_filing(filing_url, ticker) -> collection_name
-query_filing(query, ticker, top_k=5) -> str
+query_filing(query, ticker, top_k=5, min_relevance=0.0) -> str
 """
 import re
 import requests
@@ -23,7 +23,7 @@ _ef = embedding_functions.SentenceTransformerEmbeddingFunction(
 
 # ---------------------------------------------------------------------------
 # Known 10-K section headers (Item number → canonical label).
-# Ordered so that two-digit items (e.g. 9A) don't match before their
+# Ordered so that two-digit items (e.g. 9A) are matched before their
 # single-digit counterparts.
 # ---------------------------------------------------------------------------
 _SECTION_MAP = [
@@ -48,9 +48,25 @@ _SECTION_MAP = [
     (re.compile(r"\bItem\s+15\b", re.IGNORECASE), "Item 15. Exhibits"),
 ]
 
+# Pattern that identifies an EDGAR filing index page (ends with -index.htm)
+_INDEX_PAGE_RE = re.compile(r"-index\.htm$", re.IGNORECASE)
+
+# EDGAR wraps iXBRL documents in a viewer at /ix?doc=<path>.
+# This is the canonical link for the primary filing document.
+_IXBRL_DOC_RE = re.compile(
+    r'href="/ix\?doc=(/Archives/edgar/data/[^"]+\.htm)"',
+    re.IGNORECASE,
+)
+
+# Fallback: direct archive .htm href (used when no iXBRL viewer link found)
+_ARCHIVE_HTM_RE = re.compile(
+    r'href="(/Archives/edgar/data/[^"]+\.htm)"',
+    re.IGNORECASE,
+)
+
 
 def _detect_section(text: str) -> str | None:
-    """Return the canonical section label for the first Item header found in *text*."""
+    """Return the canonical section label for the first Item header in *text*."""
     earliest_pos = len(text) + 1
     earliest_label = None
     for pattern, label in _SECTION_MAP:
@@ -77,13 +93,53 @@ def _get_collection(ticker: str):
 # Text extraction
 # ---------------------------------------------------------------------------
 
+def _resolve_primary_doc(index_url: str) -> str:
+    """Follow an EDGAR filing index page to the primary document URL.
+
+    Strategy (in priority order):
+    1. iXBRL viewer link  ``/ix?doc=/Archives/...`` — this is the canonical
+       link EDGAR uses for the primary inline-XBRL filing document.
+    2. First direct ``/Archives/.../...htm`` link that is not the index page
+       itself — used for older plain-HTML filings with no iXBRL wrapper.
+
+    Returns the resolved absolute URL, or *index_url* unchanged when
+    parsing fails so callers can still attempt extraction as-is.
+    """
+    headers = {"User-Agent": settings.SEC_USER_AGENT}
+    resp = requests.get(index_url, headers=headers, timeout=15)
+    resp.raise_for_status()
+    html = resp.text
+
+    # Priority 1 — iXBRL viewer (modern EDGAR filings)
+    m = _IXBRL_DOC_RE.search(html)
+    if m:
+        return f"https://www.sec.gov{m.group(1)}"
+
+    # Priority 2 — direct archive link (older plain-HTML filings)
+    index_suffix = index_url.split("/")[-1]   # e.g. "0000320193-24-000123-index.htm"
+    for m in _ARCHIVE_HTM_RE.finditer(html):
+        href = m.group(1)
+        if index_suffix not in href:          # skip the index page itself
+            return f"https://www.sec.gov{href}"
+
+    return index_url  # fallback
+
+
 def _extract_text_from_url(url: str) -> str:
     """Download a filing and return plain text.
 
-    Handles both HTML (strip tags) and PDF (PyMuPDF) content types.
+    If *url* is an EDGAR index page (``*-index.htm``), it is first resolved
+    to the primary document URL via ``_resolve_primary_doc``.
+
+    Handles HTML (strip tags) and PDF (PyMuPDF) content types.
     Raises requests exceptions on network/HTTP errors.
     """
     headers = {"User-Agent": settings.SEC_USER_AGENT}
+
+    # Follow EDGAR index pages to the actual document
+    if _INDEX_PAGE_RE.search(url):
+        url = _resolve_primary_doc(url)
+
     resp = requests.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
     content_type = resp.headers.get("Content-Type", "")
@@ -113,7 +169,7 @@ def _chunk_text(
     Each chunk dict has:
         text        – the chunk string
         section     – canonical section label (updated whenever a new Item
-                      header is encountered)
+                      header is encountered inside the chunk)
         word_offset – index of the first word in the original word list
     """
     if not text:
@@ -128,7 +184,6 @@ def _chunk_text(
         window = words[i: i + chunk_size]
         chunk_text = " ".join(window)
 
-        # Update section whenever this chunk contains a new Item header.
         detected = _detect_section(chunk_text)
         if detected:
             current_section = detected
@@ -150,8 +205,12 @@ def _chunk_text(
 def index_filing(filing_url: str, ticker: str) -> str:
     """Download, chunk, embed, and store a 10-K filing in ChromaDB.
 
-    Idempotent — skips re-indexing if the collection already has documents.
+    *filing_url* may be either:
+    - A direct document URL (.htm / .pdf)
+    - An EDGAR filing index URL (``*-index.htm``) — automatically resolved
+      to the primary document before downloading.
 
+    Idempotent — skips re-indexing if the collection already has documents.
     Returns the ChromaDB collection name ``sec_<ticker_lower>``.
     """
     collection = _get_collection(ticker)
@@ -165,7 +224,6 @@ def index_filing(filing_url: str, ticker: str) -> str:
     documents = [c["text"] for c in chunks]
     metadatas = [{"section": c["section"], "word_offset": c["word_offset"]} for c in chunks]
 
-    # ChromaDB recommends batches ≤ 100 for large collections
     batch = 100
     for start in range(0, len(documents), batch):
         collection.add(
@@ -177,27 +235,56 @@ def index_filing(filing_url: str, ticker: str) -> str:
     return f"sec_{ticker.lower()}"
 
 
-def query_filing(query: str, ticker: str, top_k: int = 5) -> str:
+def query_filing(
+    query: str,
+    ticker: str,
+    top_k: int = 5,
+    min_relevance: float = 0.0,
+) -> str:
     """Semantic search over an indexed 10-K filing.
 
-    Returns a formatted string with section labels, relevance scores, and
-    the matching text chunks, separated by ``---``.
-    Returns ``"Filing not yet indexed."`` if the collection is empty.
+    Parameters
+    ----------
+    query:          Natural-language question or keyword phrase.
+    ticker:         Company ticker whose collection to search.
+    top_k:          Maximum number of chunks to return (ChromaDB n_results).
+    min_relevance:  Minimum cosine-similarity score (0–1) to include a chunk.
+                    Chunks below this threshold are silently dropped.
+                    Default 0.0 returns everything ChromaDB finds.
+
+    Returns a formatted string::
+
+        [Section: Item 1A. Risk Factors | Relevance: 0.842]
+        <chunk text>
+
+        ---
+
+        [Section: Item 7. MD&A | Relevance: 0.761]
+        <chunk text>
+
+    Returns ``"Filing not yet indexed."`` when the collection is empty.
+    Returns ``"No results met the minimum relevance threshold."`` when all
+    retrieved chunks fall below *min_relevance*.
     """
     collection = _get_collection(ticker)
     if collection.count() == 0:
         return "Filing not yet indexed."
 
     results = collection.query(query_texts=[query], n_results=top_k)
-    docs = results["documents"][0]
-    metas = results["metadatas"][0]
+    docs      = results["documents"][0]
+    metas     = results["metadatas"][0]
     distances = results["distances"][0]
 
     parts = []
     for doc, meta, dist in zip(docs, metas, distances):
         relevance = round(1 - dist, 3)
+        if relevance < min_relevance:
+            continue
         parts.append(
             f"[Section: {meta['section']} | Relevance: {relevance}]\n{doc}"
         )
+
+    if not parts:
+        return "No results met the minimum relevance threshold."
 
     return "\n\n---\n\n".join(parts)
