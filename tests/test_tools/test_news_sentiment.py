@@ -134,7 +134,8 @@ def test_overall_negative_when_avg_below_threshold(mock_get, monkeypatch):
 @patch("src.tools.news_sentiment.requests.get")
 def test_overall_neutral_in_middle(mock_get, monkeypatch):
     monkeypatch.setattr("src.tools.news_sentiment.settings.FINNHUB_API_KEY", "key")
-    # No sentiment keywords → neutral score = 0.0
+    # Disable LLM so keyword-only classification applies: no keywords → neutral
+    monkeypatch.setattr("src.tools.news_sentiment.settings.OPENAI_API_KEY", "")
     mock_get.return_value = _finnhub_resp([
         _article("Apple holds annual meeting"),
         _article("Apple hires new VP of marketing"),
@@ -208,6 +209,8 @@ def test_truncated_to_20_articles(mock_get, monkeypatch):
 @patch("src.tools.news_sentiment.requests.get")
 def test_overall_score_is_average_of_article_scores(mock_get, monkeypatch):
     monkeypatch.setattr("src.tools.news_sentiment.settings.FINNHUB_API_KEY", "key")
+    # Disable LLM so scores are purely keyword-derived and deterministic
+    monkeypatch.setattr("src.tools.news_sentiment.settings.OPENAI_API_KEY", "")
     mock_get.return_value = _finnhub_resp([
         _article("Apple beats earnings"),   # positive → 0.4
         _article("Apple stock drop loss"),  # negative → -0.5
@@ -224,6 +227,7 @@ def test_overall_score_is_average_of_article_scores(mock_get, monkeypatch):
 @patch("src.tools.news_sentiment.requests.get")
 def test_summary_mentions_article_count(mock_get, monkeypatch):
     monkeypatch.setattr("src.tools.news_sentiment.settings.FINNHUB_API_KEY", "key")
+    monkeypatch.setattr("src.tools.news_sentiment.settings.OPENAI_API_KEY", "")
     mock_get.return_value = _finnhub_resp([
         _article("Apple beats earnings"),
         _article("Apple stock drop"),
@@ -263,6 +267,7 @@ def test_datetime_is_formatted_string(mock_get, monkeypatch):
 def test_missing_fields_default_gracefully(mock_get, monkeypatch):
     """Finnhub article with missing keys should not crash."""
     monkeypatch.setattr("src.tools.news_sentiment.settings.FINNHUB_API_KEY", "key")
+    monkeypatch.setattr("src.tools.news_sentiment.settings.OPENAI_API_KEY", "")
     mock_get.return_value = _finnhub_resp([{}])   # completely empty article dict
     from src.tools.news_sentiment import get_news_sentiment
     result = get_news_sentiment("AAPL")
@@ -270,3 +275,110 @@ def test_missing_fields_default_gracefully(mock_get, monkeypatch):
     article = result["articles"][0]
     assert "sentiment" in article
     assert "sentiment_score" in article
+
+
+# ── LLM upgrade path ──────────────────────────────────────────────────────────
+
+@patch("src.tools.news_sentiment.requests.get")
+def test_llm_upgrade_replaces_neutral_sentiment(mock_get, monkeypatch):
+    """Neutral-keyword articles are reclassified via LLM when key is present."""
+    monkeypatch.setattr("src.tools.news_sentiment.settings.FINNHUB_API_KEY", "key")
+    monkeypatch.setattr("src.tools.news_sentiment.settings.OPENAI_API_KEY", "llm-key")
+    mock_get.return_value = _finnhub_resp([_article("Apple announces new product")])
+
+    llm_result = [("positive", 0.7)]
+    with patch("src.tools.news_sentiment._classify_with_llm", return_value=llm_result):
+        from src.tools.news_sentiment import get_news_sentiment
+        result = get_news_sentiment("AAPL")
+
+    assert result["articles"][0]["sentiment"] == "positive"
+    assert result["articles"][0]["sentiment_score"] == 0.7
+
+
+@patch("src.tools.news_sentiment.requests.get")
+def test_llm_upgrade_not_called_for_keyword_classified(mock_get, monkeypatch):
+    """Articles already classified by keyword skip the LLM call."""
+    monkeypatch.setattr("src.tools.news_sentiment.settings.FINNHUB_API_KEY", "key")
+    monkeypatch.setattr("src.tools.news_sentiment.settings.OPENAI_API_KEY", "llm-key")
+    # "surge" and "profit" are positive keywords → no LLM needed
+    mock_get.return_value = _finnhub_resp([_article("Apple profit surge record")])
+
+    with patch("src.tools.news_sentiment._classify_with_llm") as mock_llm:
+        from src.tools.news_sentiment import get_news_sentiment
+        get_news_sentiment("AAPL")
+    mock_llm.assert_not_called()
+
+
+def test_classify_with_llm_no_key_returns_neutral(monkeypatch):
+    monkeypatch.setattr("src.tools.news_sentiment.settings.OPENAI_API_KEY", "")
+    from src.tools.news_sentiment import _classify_with_llm
+    result = _classify_with_llm(["Apple opens new store", "Analyst upgrades Apple"])
+    assert result == [("neutral", 0.0), ("neutral", 0.0)]
+
+
+def test_classify_with_llm_empty_list_returns_empty(monkeypatch):
+    monkeypatch.setattr("src.tools.news_sentiment.settings.OPENAI_API_KEY", "key")
+    from src.tools.news_sentiment import _classify_with_llm
+    assert _classify_with_llm([]) == []
+
+
+# ── Finnhub built-in sentiment ────────────────────────────────────────────────
+
+@patch("src.tools.news_sentiment.requests.get")
+def test_finnhub_sentiment_score_used_as_overall(mock_get, monkeypatch):
+    """When /news-sentiment returns a score it overrides the article average."""
+    monkeypatch.setattr("src.tools.news_sentiment.settings.FINNHUB_API_KEY", "key")
+    monkeypatch.setattr("src.tools.news_sentiment.settings.OPENAI_API_KEY", "")
+
+    news_resp = _finnhub_resp([_article("Apple beats earnings")])
+    # /news-sentiment returns score=0.8 → normalised to (0.8-0.5)*2 = 0.6
+    sentiment_resp = MagicMock()
+    sentiment_resp.raise_for_status.return_value = None
+    sentiment_resp.json.return_value = {"sentiment": {"score": 0.8}}
+
+    mock_get.side_effect = [news_resp, sentiment_resp]
+
+    from src.tools.news_sentiment import get_news_sentiment
+    result = get_news_sentiment("AAPL")
+    assert result["overall_score"] == 0.6
+    assert result["overall_sentiment"] == "positive"
+
+
+@patch("src.tools.news_sentiment.requests.get")
+def test_finnhub_sentiment_score_missing_falls_back_to_avg(mock_get, monkeypatch):
+    """When /news-sentiment has no score, article average is used."""
+    monkeypatch.setattr("src.tools.news_sentiment.settings.FINNHUB_API_KEY", "key")
+    monkeypatch.setattr("src.tools.news_sentiment.settings.OPENAI_API_KEY", "")
+
+    news_resp = _finnhub_resp([_article("Apple beat earnings")])  # "beat" keyword → 0.4
+    bad_resp = MagicMock()
+    bad_resp.raise_for_status.return_value = None
+    bad_resp.json.return_value = {}   # no "sentiment" key
+
+    mock_get.side_effect = [news_resp, bad_resp]
+
+    from src.tools.news_sentiment import get_news_sentiment
+    result = get_news_sentiment("AAPL")
+    assert result["overall_score"] == 0.4  # keyword score for "beat"
+
+
+@patch("src.tools.news_sentiment.requests.get")
+def test_summary_mentions_finnhub_source_when_available(mock_get, monkeypatch):
+    monkeypatch.setattr("src.tools.news_sentiment.settings.FINNHUB_API_KEY", "key")
+    monkeypatch.setattr("src.tools.news_sentiment.settings.OPENAI_API_KEY", "")
+
+    news_resp = _finnhub_resp([_article("Apple beats earnings")])
+    sentiment_resp = MagicMock()
+    sentiment_resp.raise_for_status.return_value = None
+    sentiment_resp.json.return_value = {"sentiment": {"score": 0.75}}
+    mock_get.side_effect = [news_resp, sentiment_resp]
+
+    from src.tools.news_sentiment import get_news_sentiment
+    result = get_news_sentiment("AAPL")
+    assert "Finnhub" in result["sentiment_summary"]
+
+
+def test_finnhub_overall_sentiment_no_key_returns_none(monkeypatch):
+    monkeypatch.setattr("src.tools.news_sentiment.settings.FINNHUB_API_KEY", "")
+    from src.tools.news_sentiment import _finnhub_overall_sentiment
+    assert _finnhub_overall_sentiment("AAPL") is None
